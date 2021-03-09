@@ -10,14 +10,14 @@ pipeline {
         stage('build image') {
             steps {
                 script {
-                    docker.build("pestotoast/notify_push", "--no-cache --pull .")
+                    dockerImage= docker.build("pestotoast/notify_push", "--no-cache --pull .")
                 }
             }
         }
         stage('push image') {
             steps {
                 script {
-                    docker.build("pestotoast/notify_push", "--no-cache --pull .")
+                    dockerImage.push()
                 }
             }
         }
