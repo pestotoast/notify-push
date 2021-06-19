@@ -1,5 +1,5 @@
 use color_eyre::{eyre::WrapErr, Result};
-use flexi_logger::{colored_detailed_format, LogTarget, Logger};
+use flexi_logger::{colored_detailed_format, detailed_format, Logger};
 use notify_push::config::{Config, Opt};
 use notify_push::message::DEBOUNCE_ENABLE;
 use notify_push::metrics::serve_metrics;
@@ -30,9 +30,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let log_handle = Logger::with_str(&config.log_level)
-        .log_target(LogTarget::StdOut)
-        .format(colored_detailed_format)
+    let log_handle = Logger::try_with_str(&config.log_level)?
+        .log_to_stdout()
+        .format(if config.no_ansi {
+            detailed_format
+        } else {
+            colored_detailed_format
+        })
         .start()?;
 
     let (serve_cancel, serve_cancel_handle) = oneshot::channel();
@@ -57,11 +61,11 @@ async fn main() -> Result<()> {
     }
 
     log::trace!("Listening on {}", bind);
-    let server = spawn(serve(app.clone(), bind, serve_cancel_handle));
+    let server = spawn(serve(app.clone(), bind, serve_cancel_handle)?);
 
     if let Some(metrics_bind) = metrics_bind {
         log::trace!("Metrics listening {}", metrics_bind);
-        spawn(serve_metrics(metrics_bind, metrics_cancel_handle));
+        spawn(serve_metrics(metrics_bind, metrics_cancel_handle)?);
     }
 
     spawn(listen_loop(app, listen_cancel_handle));

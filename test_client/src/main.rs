@@ -7,7 +7,7 @@ use tungstenite::{connect, Message};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    Logger::with_str(&var("LOG").unwrap_or_else(|_| String::from("warn"))).start()?;
+    Logger::try_with_str(&var("LOG").unwrap_or_else(|_| String::from("warn")))?.start()?;
 
     let mut args = std::env::args();
 
@@ -57,10 +57,16 @@ fn main() -> Result<()> {
 
 fn get_endpoint(nc_url: &str, user: &str, password: &str) -> Result<String> {
     let raw = ureq::get(&format!("{}/ocs/v2.php/cloud/capabilities", nc_url))
-        .auth(user, password)
+        .set(
+            "Authorization",
+            &format!(
+                "Basic {}",
+                base64::encode(&format!("{}:{}", user, password))
+            ),
+        )
         .set("Accept", "application/json")
         .set("OCS-APIREQUEST", "true")
-        .call()
+        .call()?
         .into_string()?;
     log::debug!("Capabilities response: {}", raw);
     let json: Value = serde_json::from_str(&raw)

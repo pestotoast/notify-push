@@ -1,6 +1,9 @@
 use crate::config::Bind;
 use crate::serve_at;
+use color_eyre::Result;
+use serde::{Serialize, Serializer};
 use std::fmt::Write;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::oneshot;
 use warp::Filter;
@@ -14,6 +17,48 @@ pub struct Metrics {
     mapping_query_count: AtomicUsize,
     events_received: AtomicUsize,
     messages_send: AtomicUsize,
+}
+
+#[derive(Serialize)]
+struct SerializeMetrics {
+    active_connection_count: usize,
+    total_connection_count: usize,
+    mapping_query_count: usize,
+    events_received: usize,
+    messages_send: usize,
+}
+
+impl From<Metrics> for SerializeMetrics {
+    fn from(metrics: Metrics) -> Self {
+        SerializeMetrics {
+            active_connection_count: metrics.active_connection_count(),
+            total_connection_count: metrics.total_connection_count(),
+            mapping_query_count: metrics.mapping_query_count(),
+            events_received: metrics.events_received(),
+            messages_send: metrics.messages_send(),
+        }
+    }
+}
+
+impl From<&Metrics> for SerializeMetrics {
+    fn from(metrics: &Metrics) -> Self {
+        SerializeMetrics {
+            active_connection_count: metrics.active_connection_count(),
+            total_connection_count: metrics.total_connection_count(),
+            mapping_query_count: metrics.mapping_query_count(),
+            events_received: metrics.events_received(),
+            messages_send: metrics.messages_send(),
+        }
+    }
+}
+
+impl Serialize for Metrics {
+    fn serialize<S>(&self, serializer: S) -> Result<<S as Serializer>::Ok, <S as Serializer>::Error>
+    where
+        S: Serializer,
+    {
+        SerializeMetrics::from(self).serialize(serializer)
+    }
 }
 
 impl Metrics {
@@ -69,7 +114,10 @@ impl Metrics {
     }
 }
 
-pub async fn serve_metrics(bind: Bind, cancel: oneshot::Receiver<()>) {
+pub fn serve_metrics(
+    bind: Bind,
+    cancel: oneshot::Receiver<()>,
+) -> Result<impl Future<Output = ()> + Send> {
     let metrics = warp::path!("metrics").map(|| {
         let mut response = String::with_capacity(128);
         let _ = writeln!(
@@ -100,5 +148,5 @@ pub async fn serve_metrics(bind: Bind, cancel: oneshot::Receiver<()>) {
         response
     });
 
-    serve_at(metrics, bind, cancel).await;
+    serve_at(metrics, bind, cancel)
 }

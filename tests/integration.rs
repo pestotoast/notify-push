@@ -11,7 +11,7 @@ use redis::AsyncCommands;
 use smallvec::alloc::sync::Arc;
 use sqlx::AnyPool;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Mutex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::spawn;
@@ -19,18 +19,20 @@ use tokio::time::timeout;
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use warp::http::StatusCode;
 use warp::{Filter, Reply};
 
-static LAST_PORT: AtomicU16 = AtomicU16::new(1024);
+static LAST_PORT: Lazy<Mutex<u16>> = Lazy::new(|| Mutex::new(1024));
 
 async fn listen_available_port() -> Option<TcpListener> {
-    let start = LAST_PORT.load(Ordering::SeqCst) + 1;
-    for port in start..65535 {
-        LAST_PORT.store(port, Ordering::SeqCst);
+    let mut last_port = LAST_PORT.lock().unwrap();
+    for port in (*last_port + 1)..65535 {
         match TcpListener::bind(("127.0.0.1", port)).await {
-            Ok(tcp) => return Some(tcp),
+            Ok(tcp) => {
+                *last_port = port;
+                return Some(tcp);
+            }
             _ => {}
         }
     }
@@ -47,7 +49,8 @@ struct Services {
     db: AnyPool,
 }
 
-static LOG_HANDLE: Lazy<LoggerHandle> = Lazy::new(|| Logger::with_str("").start().unwrap());
+static LOG_HANDLE: Lazy<LoggerHandle> =
+    Lazy::new(|| Logger::try_with_str("").unwrap().start().unwrap());
 
 impl Services {
     pub async fn new() -> Self {
@@ -142,14 +145,15 @@ impl Services {
         Config {
             database: "sqlite::memory:?cache=shared".parse().unwrap(),
             database_prefix: "oc_".to_string(),
-            redis: format!("redis://{}", self.redis.to_string())
+            redis: vec![format!("redis://{}", self.redis.to_string())
                 .parse()
-                .unwrap(),
+                .unwrap()],
             nextcloud_url: format!("http://{}/", self.nextcloud),
             metrics_bind: None,
             log_level: "".to_string(),
             bind: Bind::Tcp(self.nextcloud.clone()),
             allow_self_signed: false,
+            no_ansi: false,
         }
     }
 
@@ -174,7 +178,7 @@ impl Services {
 
         let bind = Bind::Tcp(addr);
         spawn(async move {
-            let serve = serve(app.clone(), bind, serve_rx);
+            let serve = serve(app.clone(), bind, serve_rx).unwrap();
             let listen = listen_loop(app.clone(), listen_rx);
 
             pin_mut!(serve);
@@ -193,7 +197,7 @@ impl Services {
     }
 
     async fn redis_client(&self) -> redis::aio::Connection {
-        let client = redis::Client::open(self.config().redis).unwrap();
+        let client = redis::Client::open(self.config().redis.first().unwrap().clone()).unwrap();
         client.get_async_connection().await.unwrap()
     }
 
@@ -228,14 +232,18 @@ struct ServerHandle {
 }
 
 impl ServerHandle {
-    async fn connect(&self) -> WebSocketStream<TcpStream> {
+    async fn connect(&self) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
         tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", self.port))
             .await
             .unwrap()
             .0
     }
 
-    async fn connect_auth(&self, username: &str, password: &str) -> WebSocketStream<TcpStream> {
+    async fn connect_auth(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
         let mut client =
             tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", self.port))
                 .await
@@ -251,7 +259,7 @@ impl ServerHandle {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_auth() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -264,7 +272,7 @@ async fn test_auth() {
     assert_next_message(&mut client, "authenticated").await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_auth_failure() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -278,7 +286,10 @@ async fn test_auth_failure() {
 }
 
 #[track_caller]
-async fn assert_next_message(client: &mut WebSocketStream<TcpStream>, expected: &str) {
+async fn assert_next_message(
+    client: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    expected: &str,
+) {
     assert_eq!(
         timeout(Duration::from_millis(200), client.next())
             .await
@@ -290,13 +301,14 @@ async fn assert_next_message(client: &mut WebSocketStream<TcpStream>, expected: 
 }
 
 #[track_caller]
-async fn assert_no_message(client: &mut WebSocketStream<TcpStream>) {
+async fn assert_no_message(client: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
+    sleep(Duration::from_millis(5)).await;
     assert!(timeout(Duration::from_millis(10), client.next())
         .await
         .is_err());
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_activity() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -311,9 +323,10 @@ async fn test_notify_activity() {
         .unwrap();
 
     assert_next_message(&mut client, "notify_activity").await;
+    std::mem::forget(services);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_activity_other_user() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -330,7 +343,7 @@ async fn test_notify_activity_other_user() {
     assert_no_message(&mut client).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_file() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -353,7 +366,7 @@ async fn test_notify_file() {
     assert_next_message(&mut client, "notify_file").await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_file_different_storage() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -376,7 +389,7 @@ async fn test_notify_file_different_storage() {
     assert_no_message(&mut client).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_file_multiple() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -410,7 +423,7 @@ async fn test_notify_file_multiple() {
     assert_no_message(&mut client3).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_pre_auth() {
     let services = Services::new().await;
 
@@ -435,7 +448,7 @@ async fn test_pre_auth() {
     assert_next_message(&mut client, "notify_activity").await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_notification() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -455,7 +468,7 @@ async fn test_notify_notification() {
     assert_no_message(&mut client2).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_share() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -475,7 +488,7 @@ async fn test_notify_share() {
     assert_no_message(&mut client2).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_group() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -498,7 +511,7 @@ async fn test_notify_group() {
     assert_no_message(&mut client2).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_custom() {
     let services = Services::new().await;
     services.add_user("foo", "bar");
@@ -521,7 +534,7 @@ async fn test_notify_custom() {
     assert_no_message(&mut client2).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_notify_custom_body() {
     let services = Services::new().await;
     services.add_user("foo", "bar");

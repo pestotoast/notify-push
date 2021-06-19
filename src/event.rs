@@ -1,8 +1,8 @@
 use crate::metrics::METRICS;
-use crate::UserId;
+use crate::{Redis, UserId};
 use color_eyre::{eyre::WrapErr, Result};
 use parse_display::Display;
-use redis::{Client, Msg};
+use redis::Msg;
 use serde::Deserialize;
 use serde_json::Value;
 use std::convert::TryFrom;
@@ -49,6 +49,12 @@ pub enum Config {
     LogRestore,
 }
 
+#[derive(Debug, Deserialize, Display)]
+#[serde(rename_all = "snake_case")]
+pub enum Query {
+    Metrics,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Custom {
     pub user: UserId,
@@ -77,6 +83,8 @@ pub enum Event {
     Custom(Custom),
     #[display("config update")]
     Config(Config),
+    #[display("{0} query")]
+    Query(Query),
 }
 
 #[derive(Debug, Error)]
@@ -119,19 +127,21 @@ impl TryFrom<Msg> for Event {
             "notify_config" => Ok(Event::Config(serde_json::from_slice(
                 msg.get_payload_bytes(),
             )?)),
+            "notify_query" => Ok(Event::Query(serde_json::from_slice(
+                msg.get_payload_bytes(),
+            )?)),
             _ => Err(MessageDecodeError::UnsupportedEventType),
         }
     }
 }
 
 pub async fn subscribe(
-    client: &Client,
+    client: &Redis,
 ) -> Result<impl Stream<Item = Result<Event, MessageDecodeError>>> {
-    let con = client
-        .get_async_connection()
+    let mut pubsub = client
+        .pubsub()
         .await
         .wrap_err("Failed to connect to redis")?;
-    let mut pubsub = con.into_pubsub();
     let channels = [
         "notify_storage_update",
         "notify_group_membership_update",
@@ -142,6 +152,7 @@ pub async fn subscribe(
         "notify_pre_auth",
         "notify_custom",
         "notify_config",
+        "notify_query",
     ];
     for channel in channels.iter() {
         pubsub

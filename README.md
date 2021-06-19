@@ -112,7 +112,7 @@ You can probably use the same webserver that you're already using for your nextc
 If you're using nginx, add the following `location` block to the existing `server` block of the nextcloud server.
 
 ```nginx
-location /push/ {
+location ^~ /push/ {
     proxy_pass http://127.0.0.1:7867/;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
@@ -154,6 +154,15 @@ Afterwards you can restart apache using
 sudo systemctl restart apache2
 ```
 
+#### Caddy v2
+
+```Caddyfile
+route /push/* {
+    uri strip_prefix /push
+    reverse_proxy http://127.0.0.1:7867/
+}
+```
+
 ### Nextcloud app
 
 Once the push server is configured and the reverse proxy setup, you can enable the `notify_push` app and tell it where
@@ -172,7 +181,7 @@ By default, the push server only logs warnings, you can temporarily change the l
 occ notify_push:log <level>
 ```
 
-Where level is `error`, `warn`, `info`, debug` or `trace`, or restore the log level to the previous value using
+Where level is `error`, `warn`, `info`, `debug` or `trace`, or restore the log level to the previous value using
 
 ```bash
 occ notify_push:log --restore
@@ -191,6 +200,21 @@ Once set the metrics are available in a prometheus compatible format at `/metric
 
 If your nextcloud is using a self-signed certificate then you either need to set the `NEXTCLOUD_URL` to a non-https, local url,
 or disable certificate verification by setting `ALLOW_SELF_SIGNED=true`.
+
+## Troubleshooting
+
+When running into issues you should always first ensure that you're on the latest release, as your issue might either
+already be fixed or additional diagnostics might have been added.
+
+### "push server is not a trusted proxy"
+
+- Ensure you haven't added a duplicate `trusted_proxies` list to your `config.php`.
+- If you're modified your `forwarded_for_headers` config, ensure that `HTTP_X_FORWARDED_FOR` is included.
+- If your nextcloud hostname resolves do a dynamic ip you can try setting the `NEXTCLOUD_URL` to the internal ip of the server.
+  
+  Alternatively, editing the `/etc/hosts` file to point your nextcloud domain to the internal ip can work in some setups.
+- If you're running your setup in docker and your containers are linked, you should be able to use the name of the nextcloud container as hostname in the `NEXTCLOUD_URL`
+
 
 ## Developing
 
@@ -263,7 +287,7 @@ discover_endpoint(nextcloud_url, username, password).then((endpoint) => {
 
 For development purposes a test client is provided which can be downloaded from
 the [github actions](https://github.com/nextcloud/notify_push/actions/workflows/rust.yml) page.<br>
-(Click on a run from the list, e.g. [this one](https://github.com/nextcloud/notify_push/actions/runs/615473236), scroll to the bottom and click on `test_client` to download the binary.)<br>
+(Click on a run from the list, e.g. [this one](https://github.com/nextcloud/notify_push/actions/runs/743948106), scroll to the bottom and click on `test_client` to download the binary.)<br>
 Please note: the Test client only works on x86_64 Linux currently.
 
 ```bash
@@ -274,7 +298,7 @@ Note that this does not support two-factor authentication of non-default login f
 
 ### Building
 
-The server binary is built using rust and cargo, `0.1.3` requires a minimum of rust `1.46` while later versions can be build with `1.45`.
+The server binary is built using rust and cargo, and requires a minimum of rust `1.46`.
 
 - Install `rust` through your package manager or [rustup](https://rustup.rs/)
 - Run `cargo build`
@@ -291,3 +315,5 @@ Cross compiling for other platform is done easiest using [`cross`](https://githu
 ```bash
 cross build --release --target=aarch64-unknown-linux-musl
 ```
+
+If you're running into an issue building the `termion` dependency on a non-linux OS, try building with `--no-default-features`.
