@@ -22,12 +22,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: get git tag
-        run: echo "GIT_TAG=`echo $(git describe --tags --abbrev=0)`" >> $GITHUB_ENV          
 
       - name: Push my own image to GitHub Packages
         uses: docker/build-push-action@v2
         with:
-          tags: ghcr.io/pestotoast/notify-push:"$GIT_TAG"
+          tags: ghcr.io/pestotoast/notify-push:latest
           push: true
 
