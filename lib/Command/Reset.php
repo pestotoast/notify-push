@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 /**
- * @copyright Copyright (c) 2020 Robin Appelman <robin@icewind.nl>
+ * @copyright Copyright (c) 2021 Robin Appelman <robin@icewind.nl>
  *
  * @license GNU AGPL version 3 or any later version
  *
@@ -21,13 +21,35 @@ declare(strict_types=1);
  *
  */
 
-namespace OCA\NotifyPush\Queue;
+namespace OCA\NotifyPush\Command;
 
-interface IQueue {
+use OCA\NotifyPush\Queue\IQueue;
+use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Output\OutputInterface;
+
+class Reset extends Command {
+	private $queue;
+
+	public function __construct(
+		IQueue $queue
+	) {
+		parent::__construct();
+		$this->queue = $queue;
+	}
+
 	/**
-	 * @param string $channel
-	 * @param mixed $message
 	 * @return void
 	 */
-	public function push(string $channel, $message);
+	protected function configure() {
+		$this
+			->setName('notify_push:reset')
+			->setDescription('Cancel all active connections to the push server');
+		parent::configure();
+	}
+
+	protected function execute(InputInterface $input, OutputInterface $output) {
+		$this->queue->push("notify_signal", "reset");
+		return 0;
+	}
 }

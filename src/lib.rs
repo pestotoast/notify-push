@@ -1,4 +1,4 @@
-use crate::config::{Bind, Config};
+use crate::config::{Bind, Config, TlsConfig};
 use crate::connection::{handle_user_socket, ActiveConnections};
 use crate::event::{
     Activity, Custom, Event, GroupUpdate, Notification, PreAuth, ShareCreate, StorageUpdate,
@@ -25,8 +25,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
-use tokio::sync::oneshot;
 use tokio::sync::Mutex;
+use tokio::sync::{broadcast, oneshot};
 use tokio::time::sleep;
 use tokio_stream::wrappers::UnixListenerStream;
 use warp::filters::addr::remote;
@@ -51,6 +51,8 @@ pub struct App {
     test_cookie: AtomicU32,
     redis: Redis,
     log_handle: Mutex<LoggerHandle>,
+    reset_tx: broadcast::Sender<()>,
+    _reset_rx: broadcast::Receiver<()>,
 }
 
 impl App {
@@ -64,6 +66,8 @@ impl App {
 
         let redis = Redis::new(config.redis)?;
 
+        let (reset_tx, reset_rx) = broadcast::channel(1);
+
         Ok(App {
             connections,
             nc_client,
@@ -72,6 +76,8 @@ impl App {
             storage_mapping,
             redis,
             log_handle: Mutex::new(log_handle),
+            reset_tx,
+            _reset_rx: reset_rx,
         })
     }
 
@@ -91,6 +97,8 @@ impl App {
 
         let redis = Redis::new(config.redis)?;
 
+        let (reset_tx, reset_rx) = broadcast::channel(1);
+
         Ok(App {
             connections,
             nc_client,
@@ -99,6 +107,8 @@ impl App {
             storage_mapping,
             redis,
             log_handle: Mutex::new(log_handle),
+            reset_tx,
+            _reset_rx: reset_rx,
         })
     }
 
@@ -213,7 +223,17 @@ impl App {
                 }
                 Err(e) => log::warn!("Failed to set metrics: {}", e),
             },
+            Event::Signal(event::Signal::Reset) => {
+                log::info!("Stopping all open connections");
+                if let Err(e) = self.reset_tx.send(()) {
+                    log::warn!("Failed to send reset command to all connections: {}", e);
+                }
+            }
         }
+    }
+
+    pub fn reset_rx(&self) -> broadcast::Receiver<()> {
+        self.reset_tx.subscribe()
     }
 }
 
@@ -221,6 +241,7 @@ pub fn serve(
     app: Arc<App>,
     bind: Bind,
     cancel: oneshot::Receiver<()>,
+    tls: Option<&TlsConfig>,
 ) -> Result<impl Future<Output = ()> + Send> {
     let app = warp::any().map(move || app.clone());
 
@@ -308,7 +329,7 @@ pub fn serve(
 
     let version = warp::path!("test" / "version")
         .and(warp::post())
-        .and(app.clone())
+        .and(app)
         .and_then(|app: Arc<App>| async move {
             Result::<_, Infallible>::Ok(match app.redis.connect().await {
                 Ok(mut client) => {
@@ -332,22 +353,41 @@ pub fn serve(
         .or(remote_test)
         .or(version);
 
-    serve_at(routes, bind, cancel)
+    let routes = routes.clone().or(warp::path!("push" / ..).and(routes));
+
+    serve_at(routes, bind, cancel, tls)
 }
 
-fn serve_at<F, C>(filter: F, bind: Bind, cancel: C) -> Result<impl Future<Output = ()> + Send>
+fn serve_at<F, C>(
+    filter: F,
+    bind: Bind,
+    cancel: C,
+    tls: Option<&TlsConfig>,
+) -> Result<impl Future<Output = ()> + Send>
 where
     C: Future + Send + Sync + 'static,
     F: Filter + Clone + Send + Sync + 'static,
     F::Extract: Reply,
 {
     let cancel = cancel.map(|_| ());
-    match bind {
-        Bind::Tcp(addr) => {
-            let (_, server) = warp::serve(filter).bind_with_graceful_shutdown(addr, cancel);
-            Ok(Either::Left(server))
+    let server = warp::serve(filter);
+    match (bind, tls) {
+        (Bind::Tcp(addr), Some(tls)) => {
+            let (_, server) = server
+                .tls()
+                .cert_path(&tls.cert)
+                .key_path(&tls.key)
+                .bind_with_graceful_shutdown(addr, cancel);
+            Ok(Either::Left(Either::Left(server)))
         }
-        Bind::Unix(socket_path, permissions) => {
+        (Bind::Tcp(addr), None) => {
+            let (_, server) = server.bind_with_graceful_shutdown(addr, cancel);
+            Ok(Either::Left(Either::Right(server)))
+        }
+        (Bind::Unix(socket_path, permissions), tls) => {
+            if tls.is_some() {
+                log::warn!("Serving with TLS over a unix socket is not supported");
+            }
             fs::remove_file(&socket_path).ok();
 
             let listener = UnixListener::bind(&socket_path).wrap_err_with(|| {
@@ -360,7 +400,7 @@ where
 
             let stream = UnixListenerStream::new(listener);
             Ok(Either::Right(
-                warp::serve(filter)
+                server
                     .serve_incoming_with_graceful_shutdown(stream, cancel)
                     .map(move |_| {
                         fs::remove_file(&socket_path).ok();

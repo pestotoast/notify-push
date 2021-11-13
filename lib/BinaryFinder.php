@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 /**
- * @copyright Copyright (c) 2020 Robin Appelman <robin@icewind.nl>
+ * @copyright Copyright (c) 2021 Robin Appelman <robin@icewind.nl>
  *
  * @license GNU AGPL version 3 or any later version
  *
@@ -21,13 +21,23 @@ declare(strict_types=1);
  *
  */
 
-namespace OCA\NotifyPush\Queue;
+namespace OCA\NotifyPush;
 
-interface IQueue {
-	/**
-	 * @param string $channel
-	 * @param mixed $message
-	 * @return void
-	 */
-	public function push(string $channel, $message);
+class BinaryFinder {
+	public function getArch(): string {
+		$arch = php_uname('m');
+		if (strpos($arch, 'armv7') === 0) {
+			return 'armv7';
+		}
+		if (strpos($arch, 'aarch64') === 0) {
+			return 'aarch64';
+		}
+		return $arch;
+	}
+
+	public function getBinaryPath(): string {
+		$basePath = realpath(__DIR__ . '/../bin/');
+		$arch = $this->getArch();
+		return "$basePath/$arch/notify_push";
+	}
 }

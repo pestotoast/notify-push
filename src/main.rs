@@ -1,5 +1,5 @@
 use color_eyre::{eyre::WrapErr, Result};
-use flexi_logger::{colored_detailed_format, detailed_format, Logger};
+use flexi_logger::{detailed_format, AdaptiveFormat, Logger};
 use notify_push::config::{Config, Opt};
 use notify_push::message::DEBOUNCE_ENABLE;
 use notify_push::metrics::serve_metrics;
@@ -30,14 +30,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let log_handle = Logger::try_with_str(&config.log_level)?
-        .log_to_stdout()
-        .format(if config.no_ansi {
-            detailed_format
-        } else {
-            colored_detailed_format
-        })
-        .start()?;
+    let log_handle = Logger::try_with_str(&config.log_level)?.log_to_stdout();
+    let log_handle = if config.no_ansi {
+        log_handle.format_for_stdout(detailed_format)
+    } else {
+        log_handle.adaptive_format_for_stdout(AdaptiveFormat::Detailed)
+    }
+    .start()?;
 
     let (serve_cancel, serve_cancel_handle) = oneshot::channel();
     let (metrics_cancel, metrics_cancel_handle) = oneshot::channel();
@@ -54,6 +53,7 @@ async fn main() -> Result<()> {
     }
 
     let bind = config.bind.clone();
+    let tls = config.tls.clone();
     let metrics_bind = config.metrics_bind.clone();
     let app = Arc::new(App::new(config, log_handle).await?);
     if let Err(e) = app.self_test().await {
@@ -61,11 +61,15 @@ async fn main() -> Result<()> {
     }
 
     log::trace!("Listening on {}", bind);
-    let server = spawn(serve(app.clone(), bind, serve_cancel_handle)?);
+    let server = spawn(serve(app.clone(), bind, serve_cancel_handle, tls.as_ref())?);
 
     if let Some(metrics_bind) = metrics_bind {
         log::trace!("Metrics listening {}", metrics_bind);
-        spawn(serve_metrics(metrics_bind, metrics_cancel_handle)?);
+        spawn(serve_metrics(
+            metrics_bind,
+            metrics_cancel_handle,
+            tls.as_ref(),
+        )?);
     }
 
     spawn(listen_loop(app, listen_cancel_handle));
