@@ -66,6 +66,11 @@ class CoreEventsTest extends TestCase {
 		$storage->touch('foobar', 100);
 		$storage->getUpdater()->update('foobar');
 
+		// file ids are unstable, so we remove them
+		foreach ($events['notify_storage_update'] as &$event) {
+			unset($event['file_id']);
+		}
+
 		$this->assertEquals([
 			'notify_storage_update' => [
 				['storage' => $cache->getNumericStorageId(), 'path' => 'foobar'],

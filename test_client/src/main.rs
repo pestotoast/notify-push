@@ -1,5 +1,6 @@
 use color_eyre::{eyre::WrapErr, Report, Result};
-use flexi_logger::Logger;
+use flexi_logger::{AdaptiveFormat, Logger};
+use log::{debug, info, trace, warn};
 use serde_json::Value;
 use std::env::var;
 use tungstenite::http::Request;
@@ -7,7 +8,10 @@ use tungstenite::{connect, Message};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    Logger::try_with_str(&var("LOG").unwrap_or_else(|_| String::from("warn")))?.start()?;
+    Logger::try_with_str(&var("LOG").unwrap_or_else(|_| String::from("test_client=info,warn")))?
+        .adaptive_format_for_stdout(AdaptiveFormat::Detailed)
+        .adaptive_format_for_stderr(AdaptiveFormat::Detailed)
+        .start()?;
 
     let mut args = std::env::args();
 
@@ -21,7 +25,7 @@ fn main() -> Result<()> {
     };
 
     let ws_url = get_endpoint(&nc_url, &username, &password)?;
-    println!("Found push server at {}", ws_url);
+    info!("Found push server at {}", ws_url);
 
     let ws_request = Request::get(ws_url)
         .body(())
@@ -34,22 +38,25 @@ fn main() -> Result<()> {
     socket
         .write_message(Message::Text(password))
         .wrap_err("Failed to send password")?;
+    socket
+        .write_message(Message::Text("listen notify_file_id".into()))
+        .wrap_err("Failed to send username")?;
 
     loop {
         if let Message::Text(text) = socket.read_message()? {
             if text.starts_with("err: ") {
-                eprintln!("Received error: {}", &text[5..]);
+                warn!("Received error: {}", &text[5..]);
                 return Ok(());
-            } else if text == "notify_file" {
-                println!("Received file update notification");
+            } else if text.starts_with("notify_file") {
+                info!("Received file update notification {}", text);
             } else if text == "notify_activity" {
-                println!("Received activity notification");
+                info!("Received activity notification");
             } else if text == "notify_notification" {
-                println!("Received notification notification");
+                info!("Received notification notification");
             } else if text == "authenticated" {
-                println!("Authenticated");
+                info!("Authenticated");
             } else {
-                println!("Received: {}", text);
+                info!("Received: {}", text);
             }
         }
     }
@@ -68,11 +75,11 @@ fn get_endpoint(nc_url: &str, user: &str, password: &str) -> Result<String> {
         .set("OCS-APIREQUEST", "true")
         .call()?
         .into_string()?;
-    log::debug!("Capabilities response: {}", raw);
+    trace!("Capabilities response: {}", raw);
     let json: Value = serde_json::from_str(&raw)
         .wrap_err_with(|| format!("Failed to decode json capabilities response: {}", raw))?;
     if let Some(capabilities) = json["ocs"]["data"]["capabilities"].as_object() {
-        log::info!(
+        debug!(
             "Supported capabilities: {:?}",
             capabilities.keys().collect::<Vec<_>>()
         );

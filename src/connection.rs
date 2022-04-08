@@ -1,4 +1,4 @@
-use crate::message::{DebounceMap, MessageType};
+use crate::message::{PushMessage, SendQueue};
 use crate::metrics::METRICS;
 use crate::{App, UserId};
 use ahash::RandomState;
@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use futures::{future::select, pin_mut, SinkExt, StreamExt};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -17,10 +17,10 @@ use warp::filters::ws::{Message, WebSocket};
 const USER_CONNECTION_LIMIT: usize = 64;
 
 #[derive(Default)]
-pub struct ActiveConnections(DashMap<UserId, broadcast::Sender<MessageType>, RandomState>);
+pub struct ActiveConnections(DashMap<UserId, broadcast::Sender<PushMessage>, RandomState>);
 
 impl ActiveConnections {
-    pub async fn add(&self, user: UserId) -> Result<broadcast::Receiver<MessageType>> {
+    pub async fn add(&self, user: UserId) -> Result<broadcast::Receiver<PushMessage>> {
         if let Some(sender) = self.0.get(&user) {
             // stop a single user from trying to eat all the resources
             if sender.receiver_count() > USER_CONNECTION_LIMIT {
@@ -35,11 +35,16 @@ impl ActiveConnections {
         }
     }
 
-    pub async fn send_to_user(&self, user: &UserId, msg: MessageType) {
+    pub async fn send_to_user(&self, user: &UserId, msg: PushMessage) {
         if let Some(tx) = self.0.get(user) {
             tx.send(msg).ok();
         }
     }
+}
+
+#[derive(Default)]
+pub struct ConnectionOptions {
+    pub listen_file_id: AtomicBool,
 }
 
 pub async fn handle_user_socket(mut ws: WebSocket, app: Arc<App>, forwarded_for: Vec<IpAddr>) {
@@ -78,6 +83,8 @@ pub async fn handle_user_socket(mut ws: WebSocket, app: Arc<App>, forwarded_for:
 
     METRICS.add_connection();
 
+    let opts = ConnectionOptions::default();
+
     // Every time we send a ping, we set this to a random non-zero value
     // when a pong is returned, we check it against the expected value and reset this to 0
     // If we get the wrong pong back, or the expected value hasn't been cleared
@@ -85,46 +92,50 @@ pub async fn handle_user_socket(mut ws: WebSocket, app: Arc<App>, forwarded_for:
     let expect_pong = AtomicUsize::default();
     let expect_pong = &expect_pong;
 
-    let transmit = async move {
-        let mut debounce = DebounceMap::default();
+    let transmit = async {
+        let mut send_queue = SendQueue::default();
 
         let mut reset = app.reset_rx();
 
+        let ping_interval = Duration::from_secs(30);
+        let mut last_send = Instant::now() - ping_interval;
+
         'tx_loop: loop {
             tokio::select! {
-                msg = timeout(Duration::from_secs(30), rx.recv()) => {
+                msg = timeout(Duration::from_millis(500), rx.recv()) => {
+                    let now = Instant::now();
                     match msg {
                         Ok(Ok(msg)) => {
-                            if debounce.should_send(&msg) {
+                            if let Some(msg) = send_queue.push(msg, now) {
                                 log::debug!(target: "notify_push::send", "Sending {} to {}", msg, user_id);
                                 METRICS.add_message();
-                                user_ws_tx.send(msg.into()).await.ok();
-                            } else {
-                                log::debug!(target: "notify_push::send", "Debouncing {} to {}", msg, user_id);
-                            }
-                        }
-                        Err(_timout) if debounce.has_held_message() => {
-                            // if any message got held back for debounce, we try sending them now
-                            for msg in debounce.get_held_messages() {
-                                if debounce.should_send(&msg) {
-                                    log::debug!(target: "notify_push::send", "Sending debounced {} to {}", msg, user_id);
-                                    METRICS.add_message();
-                                    user_ws_tx.send(msg.into()).await.ok();
-                                }
+                                last_send = now;
+                                user_ws_tx.send(msg.into_message(&opts)).await.ok();
                             }
                         }
                         Err(_timout) => {
-                            let data = rand::random::<NonZeroUsize>().into();
-                            let last_ping = expect_pong.swap(data, Ordering::SeqCst);
-                            if last_ping > 0 {
-                                log::info!("{} didn't reply to ping, closing", user_id);
-                                break;
+                            for msg in send_queue.drain(now) {
+                                last_send = now;
+                                METRICS.add_message();
+                                log::debug!(target: "notify_push::send", "Sending debounced {} to {}", msg, user_id);
+                                user_ws_tx.feed(msg.into_message(&opts)).await.ok();
                             }
-                            log::debug!(target: "notify_push::send", "Sending ping to {}", user_id);
-                            user_ws_tx
-                                .send(Message::ping(data.to_le_bytes()))
-                                .await
-                                .ok();
+
+                            if now.duration_since(last_send) > ping_interval {
+                                let data = rand::random::<NonZeroUsize>().into();
+                                let last_ping = expect_pong.swap(data, Ordering::SeqCst);
+                                if last_ping > 0 {
+                                    log::info!("{} didn't reply to ping, closing", user_id);
+                                    break;
+                                }
+                                log::debug!(target: "notify_push::send", "Sending ping to {}", user_id);
+                                last_send = now;
+                                user_ws_tx
+                                    .feed(Message::ping(data.to_le_bytes()))
+                                    .await
+                                    .ok();
+                            }
+                            user_ws_tx.flush().await.ok();
                         }
                         Ok(Err(_)) => {
                             // we dont care about dropped messages
@@ -140,7 +151,7 @@ pub async fn handle_user_socket(mut ws: WebSocket, app: Arc<App>, forwarded_for:
         }
     };
 
-    let receive = async move {
+    let receive = async {
         // handle messages until the client closes the connection
         while let Some(result) = user_ws_rx.next().await {
             match result {
@@ -149,6 +160,12 @@ pub async fn handle_user_socket(mut ws: WebSocket, app: Arc<App>, forwarded_for:
                     if msg.as_bytes() != expected.to_le_bytes() {
                         log::info!("received wrong pong, closing");
                         break;
+                    }
+                }
+                Ok(msg) if msg.is_text() => {
+                    let text = msg.to_str().unwrap_or_default();
+                    if text == "listen notify_file_id" {
+                        opts.listen_file_id.store(true, Ordering::Relaxed);
                     }
                 }
                 Ok(_) => {}

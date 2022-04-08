@@ -28,6 +28,7 @@ use OCP\Activity\IConsumer;
 use OCP\Activity\IEvent;
 use OCP\EventDispatcher\Event;
 use OCP\Files\Cache\ICacheEvent;
+use OCP\Files\IHomeStorage;
 use OCP\Group\Events\UserAddedEvent;
 use OCP\Group\Events\UserRemovedEvent;
 use OCP\Notification\IApp;
@@ -46,9 +47,22 @@ class Listener implements IConsumer, IApp, INotifier, IDismissableNotifier {
 
 	public function cacheListener(Event $event): void {
 		if ($event instanceof ICacheEvent) {
+			// ignore files in home storage but outside home directory (trashbin, versions, etc)
+			if (
+				$event->getStorage()->instanceOfStorage(IHomeStorage::class) && !(
+					$event->getPath() === 'files' || strpos($event->getPath(), "files/") === 0
+				)
+			) {
+				return;
+			}
+			// ignore appdata
+			if (strpos($event->getPath(), 'appdata_') === 0) {
+				return;
+			}
 			$this->queue->push('notify_storage_update', [
 				'storage' => $event->getStorageId(),
 				'path' => $event->getPath(),
+				'file_id' => $event->getFileId(),
 			]);
 		}
 	}
